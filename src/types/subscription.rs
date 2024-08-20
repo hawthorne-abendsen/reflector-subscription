@@ -5,24 +5,24 @@ use super::{subscription_status::SubscriptionStatus, ticker_asset::TickerAsset};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 
-// The configuration parameters for the contract.
+// Subscription record properties
 pub struct Subscription {
-    // The owner address.
+    // Address of account that owns this subscription
     pub owner: Address,
-    // Base ticker asset.
+    // Base symbol
     pub base: TickerAsset,
-    // Quote ticker asset.
+    // Quote symbol
     pub quote: TickerAsset,
-    // The threshold in percentage.
+    // Price movement threshold that triggers subscription, in ‰
     pub threshold: u32,
-    // The heartbeat in minutes.
+    // Interval of periodic invocations, in minutes
     pub heartbeat: u32,
     // The webhook.
     pub webhook: Bytes,
-    // Balance
+    // Current outstanding subscription balance
     pub balance: u64,
-    // The subscription status.
+    // Current status
     pub status: SubscriptionStatus,
-    // The last change timestamp.
+    // Last updated timestamp
     pub updated: u64
 }

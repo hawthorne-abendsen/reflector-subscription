@@ -5,7 +5,7 @@ mod types;
 
 use extensions::env_extensions::EnvExtensions;
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, Address, BytesN, Env, Symbol, Vec
+    contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, Address, BytesN, Env, Symbol, Vec,
 };
 use types::{
     contract_config::ContractConfig, error::Error, subscription::Subscription,
@@ -17,6 +17,7 @@ const REFLECTOR: Symbol = symbol_short!("reflector");
 // 1 day in milliseconds
 const DAY: u64 = 86400 * 1000;
 
+// Maximum allowed encrypted webhook size, in bytes
 const MAX_WEBHOOK_SIZE: u32 = 2048;
 
 // Minimum heartbeat in minutes
@@ -29,7 +30,8 @@ pub struct SubscriptionContract;
 impl SubscriptionContract {
     // Admin only
 
-    // Initializes the contract. Can be invoked only once.
+    // Initialize the newly created contract
+    // Can be invoked only once
     //
     // # Arguments
     //
@@ -50,7 +52,8 @@ impl SubscriptionContract {
         e.set_last_subscription_id(0);
     }
 
-    // Sets the base fee for the contract. Can be invoked only by the admin account.
+    // Update base Reflector subscriptions fee
+    // Can be invoked only by the admin account
     //
     // # Arguments
     //
@@ -64,7 +67,8 @@ impl SubscriptionContract {
         e.set_fee(fee);
     }
 
-    // Triggers the subscription. Can be invoked only by the admin account.
+    // Publish subscription trigger event
+    // Can be invoked only by the admin account
     //
     // # Arguments
     //
@@ -76,13 +80,79 @@ impl SubscriptionContract {
     // Panics if the caller doesn't match admin address
     pub fn trigger(e: Env, timestamp: u64, trigger_hash: BytesN<32>) {
         e.panic_if_not_admin();
+        // Publish triggered event with root hash of all generated notifications
         e.events().publish(
             (REFLECTOR, symbol_short!("triggered")),
             (timestamp, trigger_hash),
         );
     }
 
-    // Updates the contract source code. Can be invoked only by the admin account.
+    // Charge retention fees from the subscription balances
+    // Can be invoked only by the admin account
+    //
+    // # Arguments
+    //
+    // * `subscription_ids` - List of subscription IDs to process
+    //
+    // # Panics
+    //
+    // Panics if the caller doesn't match admin address
+    pub fn charge(e: Env, subscription_ids: Vec<u64>) {
+        e.panic_if_not_admin();
+        let mut total_charge: u64 = 0;
+        let now = now(&e);
+        for subscription_id in subscription_ids.iter() {
+            if let Some(mut subscription) = e.get_subscription(subscription_id) {
+                // We can charge fees for several days in case if there was an interruption in background worker charge process
+                let days_charged = (now - subscription.updated) / DAY;
+                if days_charged == 0 {
+                    continue;
+                }
+                let fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
+                let mut charge = days_charged * fee;
+                // Do not charge more than left on the subscription balance
+                if subscription.balance < charge {
+                    charge = subscription.balance;
+                }
+                // Deduct calculated retention fees
+                subscription.balance -= charge;
+                subscription.updated = now;
+                // Publish charged event
+                e.events().publish(
+                    (
+                        REFLECTOR,
+                        symbol_short!("charged"),
+                        subscription.owner.clone(),
+                    ),
+                    (subscription_id, charge, now),
+                );
+                // Deactivate the subscription if the balance is less than the daily retention fee
+                if subscription.balance < fee {
+                    subscription.status = SubscriptionStatus::Suspended;
+                    // Publish suspended event
+                    e.events().publish(
+                        (
+                            REFLECTOR,
+                            symbol_short!("suspended"),
+                            subscription.owner.clone(),
+                        ),
+                        (subscription_id, now),
+                    );
+                }
+                // Update subscription properties
+                e.set_subscription(subscription_id, &subscription);
+                // Sum all retention fee charges
+                total_charge += charge;
+            }
+        }
+        // Burn tokens charged from all subscriptions
+        if total_charge > 0 {
+            get_token_client(&e).burn(&e.current_contract_address(), &(total_charge as i128));
+        }
+    }
+
+    // Update the contract source code
+    // Can be invoked only by the admin account
     //
     // # Arguments
     //
@@ -97,74 +167,13 @@ impl SubscriptionContract {
         e.deployer().update_current_contract_wasm(wasm_hash)
     }
 
-    // Withdraws funds from the contract, and updates balance of subscriptions. Can be invoked only by the admin account.
-    //
-    // # Arguments
-    //
-    // * `subscription_ids` - Subscription ID
-    //
-    // # Panics
-    //
-    // Panics if the caller doesn't match admin address
-    pub fn charge(e: Env, subscription_ids: Vec<u64>) {
-        e.panic_if_not_admin();
-        let mut total_charge: u64 = 0;
-        let now = now(&e);
-        for subscription_id in subscription_ids.iter() {
-            if let Some(mut subscription) = e.get_subscription(subscription_id) {
-                let days = (now - subscription.updated) / DAY;
-                if days == 0 {
-                    continue;
-                }
-                let fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
-                let mut charge = days * fee;
-                if subscription.balance < charge {
-                    charge = subscription.balance;
-                }
-                subscription.balance -= charge;
-                subscription.updated = now;
-                if subscription.balance < fee {
-                    // Deactivate the subscription if the balance is less than the fee
-                    subscription.status = SubscriptionStatus::Suspended;
-                    e.events().publish(
-                        (
-                            REFLECTOR,
-                            symbol_short!("suspended"),
-                            subscription.owner.clone(),
-                        ),
-                        (now, subscription_id),
-                    );
-                }
-                e.set_subscription(subscription_id, &subscription);
-
-                e.events().publish(
-                    (
-                        REFLECTOR,
-                        symbol_short!("charged"),
-                        subscription.owner,
-                    ),
-                    (now, subscription_id, charge),
-                );
-
-                total_charge += charge;
-            }
-        }
-        // If there is nothing to charge, return
-        if total_charge == 0 {
-            return;
-        }
-
-        //Burn the tokens
-        get_token_client(&e).burn(&e.current_contract_address(), &(total_charge as i128));
-    }
-
     // Public
 
-    // Creates a new subscription.
+    // Create new Reflector subscription with given parameters
     //
     // # Arguments
     //
-    // * `new_subscription` - Subscription data
+    // * `new_subscription` - Initialization parameters
     // * `amount` - Initial deposit amount
     //
     // # Returns
@@ -176,8 +185,8 @@ impl SubscriptionContract {
     // Panics if the contract is not initialized
     // Panics if the amount is less than the base fee
     // Panics if the caller doesn't match the owner address
-    // Panics if the token transfer fails
     // Panics if the subscription is invalid
+    // Panics if the token transfer fails
     pub fn create_subscription(
         e: Env,
         new_subscription: SubscriptionInitParams,
@@ -186,31 +195,30 @@ impl SubscriptionContract {
         panic_if_not_initialized(&e);
         // Check the authorization
         new_subscription.owner.require_auth();
-
-        let subscription_fee = calc_fee(&e, &new_subscription.heartbeat, &new_subscription.threshold);
-
+        // Calculate daily retention fee based on subscription params
+        let retention_fee = calc_fee(&e, &new_subscription.heartbeat, &new_subscription.threshold);
+        // Creation fee is 2 times the daily retention fee
+        let init_fee = retention_fee * 2;
         // Check the amount
-        let init_fee = subscription_fee * 2; // init fee is 2 times the subscription fee
         if amount < init_fee {
             e.panic_with_error(Error::InvalidAmount);
         }
-
+        // Check subscription heartbeat
         if MIN_HEARTBEAT > new_subscription.heartbeat {
             e.panic_with_error(Error::InvalidHeartbeat);
         }
-
+        // Check threshold
         if new_subscription.threshold == 0 || new_subscription.threshold > 10000 {
             e.panic_with_error(Error::InvalidThreshold);
         }
-
+        // Check subscription webhook size
         if new_subscription.webhook.len() > MAX_WEBHOOK_SIZE {
             e.panic_with_error(Error::WebhookTooLong);
         }
-
         // Transfer and burn the tokens
-        transfer_tokens_to_current_contract(&e, &new_subscription.owner, amount, init_fee);
-
-        //todo: check if the subscription is valid and the amount is enough
+        deposit(&e, &new_subscription.owner, amount);
+        burn(&e, init_fee, amount);
+        // Create subscription itself
         let subscription_id = e.get_last_subscription_id() + 1;
         let subscription = Subscription {
             owner: new_subscription.owner,
@@ -223,23 +231,25 @@ impl SubscriptionContract {
             status: SubscriptionStatus::Active,
             updated: now(&e), // normalize to milliseconds
         };
+        // Store
         e.set_subscription(subscription_id, &subscription);
         e.set_last_subscription_id(subscription_id);
-        
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &subscription_fee, &subscription.balance));
+        // Extend TTL based on the subscription retention fee and balance
+        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &retention_fee, &subscription.balance));
+        // Publish subscription created event
         let data = (subscription_id, subscription.clone());
         e.events()
             .publish((REFLECTOR, symbol_short!("created"), subscription.owner), data.clone());
         return data;
     }
 
-    // Deposits funds to the subscription.
+    // Deposit Reflector tokens to subscription balance
     //
     // # Arguments
     //
-    // * `from` - Sender address
-    // * `subscription_id` - Subscription ID
-    // * `amount` - Amount to deposit
+    // * `from` - Account to transfer tokens from
+    // * `subscription_id` -  Subscription ID to top up
+    // * `amount` - Amount of tokens to deposit
     //
     // # Panics
     //
@@ -250,80 +260,83 @@ impl SubscriptionContract {
     pub fn deposit(e: Env, from: Address, subscription_id: u64, amount: u64) {
         panic_if_not_initialized(&e);
         from.require_auth();
+        // Check deposit amount
         if amount == 0 {
             e.panic_with_error(Error::InvalidAmount);
         }
+        // Load subscription
         let mut subscription = e
             .get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
-        let mut burn_amount = 0;
-
-        let subscription_fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
-
+        // Calculate daily retention fee based on subscription params
+        let retention_fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
+        // Transfer tokens
+        deposit(&e, &from, amount);
+        // Update subscription balance
+        subscription.balance += amount;
+        // Update subscription status if it was suspended
         match subscription.status {
             SubscriptionStatus::Suspended => {
-                // Check if the subscription is suspended
-                if amount < subscription_fee {
-                    e.panic_with_error(Error::InvalidAmount);
-                }
-                // Set the activation fee as the burn amount
-                burn_amount = subscription_fee;
+                // Burn tokens as a revival fee
+                burn(&e, retention_fee, amount);
+                subscription.balance -= retention_fee;
+                // Re-activate saubscription
                 subscription.status = SubscriptionStatus::Active;
-            },
+            }
             _ => {}
         }
-
-        // Transfer and burn the tokens
-        transfer_tokens_to_current_contract(&e, &from, amount, burn_amount);
-
-        subscription.balance += amount - burn_amount;
+        // Update state
         e.set_subscription(subscription_id, &subscription);
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &subscription_fee, &subscription.balance));
+        // Extend TTL based on the subscription retention fee and balance
+        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &retention_fee, &subscription.balance));
+        // Publish subscription deposited event
         e.events().publish(
             (REFLECTOR, symbol_short!("deposited"), subscription.owner.clone()),
             (subscription_id, subscription, amount),
         );
     }
 
-    // Withdraws funds from the subscription and deactivates it.
+    // Cancel active subscription and reimburse the balance to subscription owner account
     //
     // # Arguments
     //
     // * `subscription_id` - Subscription ID
-    // # Panics if the contract is not initialized
-    // # Panics if the subscription does not exist
-    // # Panics if the caller doesn't match the owner address
-    // # Panics if the subscription is not active
-    // # Panics if the token transfer fails
+    //
+    // # Panics
+    //
+    // Panics if the contract is not initialized
+    // Panics if the subscription does not exist
+    // Panics if the caller doesn't match the owner address
+    // Panics if the subscription is not active
+    // Panics if the token transfer fails
     pub fn cancel(e: Env, subscription_id: u64) {
         panic_if_not_initialized(&e);
+        // Load subscription
         let subscription = e
             .get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
+        // Only owner can cancel the subscription
         subscription.owner.require_auth();
         match subscription.status {
             SubscriptionStatus::Active => {}
-            _ => {
+            _ => { // Panic if the subscription is not active at the moment
                 e.panic_with_error(Error::InvalidSubscriptionStatusError);
             }
         }
-        // Transfer the remaining balance to the owner
-        transfer_tokens(
-            &e,
-            &e.current_contract_address(),
-            &subscription.owner,
-            subscription.balance,
-        );
+        // Transfer the remaining balance to the owner account
+        withdraw(&e, &subscription.owner, subscription.balance);
+        // Remove subscription from the state
         e.remove_subscription(subscription_id);
+        // Publish subscription cancelled event
         e.events()
             .publish((REFLECTOR, symbol_short!("cancelled"), subscription.owner), subscription_id);
     }
 
-    // Gets the subscription by ID.
+    // Get subscription by ID
     //
     // # Arguments
     //
-    // * `subscription_id` - Subscription ID
+    // * `subscription_id` - Unique subscription ID
     //
     // # Returns
     //
@@ -332,22 +345,53 @@ impl SubscriptionContract {
     // # Panics
     //
     // Panics if the contract is not initialized
+    // Panics if the subscription is not found
     pub fn get_subscription(e: Env, subscription_id: u64) -> Subscription {
         panic_if_not_initialized(&e);
+        // Load subscription
         e.get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound))
     }
 
-    // Gets the last subscription ID.
+    // Calculate daily retention fee for a given subscription
+    //
+    // # Arguments
+    //
+    // * `subscription_id` - Subscription ID
     //
     // # Returns
+    //
+    // Daily retention fees
+    //
+    // # Panics
+    //
+    // Panics if the contract is not initialized
+    // Panics if the subscription is not found
+    pub fn get_retention_fee(e: Env, subscription_id: u64) -> u64 {
+        panic_if_not_initialized(&e);
+        // Load subscription
+        let subscription = e.get_subscription(subscription_id)
+            .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
+        // Calculate daily retention fee based on subscription params
+        calc_fee(&e, &subscription.heartbeat, &subscription.threshold)
+    }
+
+    // Get the last subscription ID
+    //
+    // # Returns
+    //
     // Last subscription ID
+    //
+    // # Panics
+    //
+    // Panics if the contract is not initialized
     pub fn last_id(e: Env) -> u64 {
         panic_if_not_initialized(&e);
+        // Retrieve the last value from the subscription ID counter
         e.get_last_subscription_id()
     }
 
-    // Returns admin address of the contract.
+    // Get contract admin address
     //
     // # Returns
     //
@@ -356,12 +400,13 @@ impl SubscriptionContract {
         e.get_admin()
     }
 
-    // Returns current protocol version of the contract.
+    // Get contract version
     //
     // # Returns
     //
     // Contract protocol version
     pub fn version(_e: Env) -> u32 {
+        // Retrieve protocol version based on the cargo package info
         env!("CARGO_PKG_VERSION")
             .split(".")
             .next()
@@ -370,59 +415,78 @@ impl SubscriptionContract {
             .unwrap()
     }
 
-    // Returns the base fee of the contract.
+    // Get base contract fee (used to calculate amounts charged from the account balance on the daily basis)
     //
     // # Returns
     //
     // Base fee
+    //
+    // # Panics
+    //
+    // Panics if the contract is not initialized
     pub fn fee(e: Env) -> u64 {
         panic_if_not_initialized(&e);
+        // Retrieve base Reflector subscription fee
         e.get_fee()
     }
 
-    // Returns the token address of the contract.
+    // Retrieve Reflector token contract address
     //
     // # Returns
     //
     // Token address
+    //
+    // # Panics
+    //
+    // Panics if the contract is not initialized
     pub fn token(e: Env) -> Address {
         panic_if_not_initialized(&e);
+        // Retrieve Reflector token contract address
         e.get_token()
     }
 }
 
+// Check that contract has been properly initialized already
 fn panic_if_not_initialized(e: &Env) {
     if !e.is_initialized() {
         panic_with_error!(e, Error::NotInitialized);
     }
 }
 
+// Initialize a client for Reflector token contract
 fn get_token_client(e: &Env) -> TokenClient {
     TokenClient::new(e, &e.get_token())
 }
 
-fn transfer_tokens_to_current_contract(e: &Env, from: &Address, amount: u64, burn_amount: u64) {
-    transfer_tokens(e, from, &e.current_contract_address(), amount);
-    if burn_amount > 0 {
-        let token_client = get_token_client(e);
-        token_client.burn(&e.current_contract_address(), &(burn_amount as i128));
+// Transfer tokens to the contract balance
+fn deposit(e: &Env, from: &Address, amount: u64) {
+    get_token_client(e).transfer(from, &e.current_contract_address(), &(amount as i128));
+}
+
+// Burn used tokens
+fn burn(e: &Env, burn_amount: u64, max_burn: u64) {
+    if burn_amount > max_burn {
+        panic_with_error!(e, Error::InvalidAmount);
     }
+    get_token_client(e).burn(&e.current_contract_address(), &(burn_amount as i128));
 }
 
-fn transfer_tokens(e: &Env, from: &Address, to: &Address, amount: u64) {
-    let token_client = get_token_client(e);
-    token_client.transfer(from, to, &(amount as i128));
+// Withdraw tokens from contract balance
+fn withdraw(e: &Env, to: &Address, amount: u64) {
+    get_token_client(e).transfer(&e.current_contract_address(), to, &(amount as i128));
 }
 
+// Get timestamp as milliseconds
 fn now(e: &Env) -> u64 {
-    e.ledger().timestamp() * 1000 // normalize to milliseconds
+    e.ledger().timestamp() * 1000
 }
 
 fn calc_fee(e: &Env, heartbeat: &u32, threshold: &u32) -> u64 {
-    //implement the fee calculation logic here
+    //TODO: implement the fee calculation logic here
     e.get_fee()
 }
 
+// Calculate number of ledgers to live for subscription based on retention fee
 fn calc_ledgers_to_live(e: &Env, fee: &u64, amount: &u64) -> u32 {
     let days: u32 = ((amount + fee - 1) / fee) as u32;
     let ledgers = days * 17280;

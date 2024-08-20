@@ -2,24 +2,24 @@ use soroban_sdk::contracterror;
 
 #[contracterror]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-// The error codes for the contract.
+// Contract error codes
 pub enum Error {
-    // The contract is already initialized.
+    // Contract has been already initialized
     AlreadyInitialized = 0,
-    // The caller is not authorized to perform the operation.
+    // Caller is not authorized to perform this operation
     Unauthorized = 1,
-    // The subscription does not exist.
+    // Subscription with this ID does not exist
     SubscriptionNotFound = 2,
-    // The contract is not initialized.
+    // Contract has not been initialized
     NotInitialized = 3,
-    // The amount is invalid.
+    // Initial subscription amount is not valid
     InvalidAmount = 4,
-    // The heartbeat is invalid.
+    // Heartbeat is not valid
     InvalidHeartbeat = 5,
-    // The threshold is invalid.
+    // Threshold percentage is not valid
     InvalidThreshold = 6,
-    // The webhook is too long.
+    // Subscription webhook URL is too long
     WebhookTooLong = 7,
-    // The subscription status is not valid for the operation.
+    // Current subscription status is not valid for the operation
     InvalidSubscriptionStatusError = 8
 }

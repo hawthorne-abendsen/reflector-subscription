@@ -5,10 +5,10 @@ use super::asset::Asset;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 
-// The ticker asset.
+// Ticker symbol descriptor
 pub struct TickerAsset {
-    // The admin address.
+    // Asset identifier
     pub asset: Asset,
-    // The source of the asset
+    // Price feed source
     pub source: String
 }

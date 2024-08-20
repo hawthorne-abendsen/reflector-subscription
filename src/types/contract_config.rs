@@ -3,12 +3,12 @@ use soroban_sdk::{contracttype, Address};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 
-// The configuration parameters for the contract.
+// Initial contract configuration parameters
 pub struct ContractConfig {
-    // The admin address.
+    // Contract admin address
     pub admin: Address,
-    // The base asset for the prices.
+    // Retention fee token address
     pub token: Address,
-    // The base fee for the contract.
-    pub fee: u64,
+    // Base contract fee amount
+    pub fee: u64
 }
