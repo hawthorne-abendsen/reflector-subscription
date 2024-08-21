@@ -3,13 +3,13 @@
 mod extensions;
 mod types;
 
-use extensions::env_extensions::EnvExtensions;
+use extensions::{env_extensions::EnvExtensions, u128_extensions::U128Extensions};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, token::TokenClient, Address, BytesN, Env, Symbol, Vec,
 };
 use types::{
     contract_config::ContractConfig, error::Error, subscription::Subscription,
-    subscription_init_params::SubscriptionInitParams, subscription_status::SubscriptionStatus,
+    subscription_init_params::SubscriptionInitParams, subscription_status::SubscriptionStatus, ticker_asset::TickerAsset,
 };
 
 const REFLECTOR: Symbol = symbol_short!("reflector");
@@ -108,7 +108,7 @@ impl SubscriptionContract {
                 if days_charged == 0 {
                     continue;
                 }
-                let fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
+                let fee = calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat);
                 let mut charge = days_charged * fee;
                 // Do not charge more than left on the subscription balance
                 if subscription.balance < charge {
@@ -196,7 +196,7 @@ impl SubscriptionContract {
         // Check the authorization
         new_subscription.owner.require_auth();
         // Calculate daily retention fee based on subscription params
-        let retention_fee = calc_fee(&e, &new_subscription.heartbeat, &new_subscription.threshold);
+        let retention_fee = calc_fee(e.get_fee(), &new_subscription.base, &new_subscription.quote, new_subscription.heartbeat);
         // Creation fee is 2 times the daily retention fee
         let init_fee = retention_fee * 2;
         // Check the amount
@@ -235,7 +235,7 @@ impl SubscriptionContract {
         e.set_subscription(subscription_id, &subscription);
         e.set_last_subscription_id(subscription_id);
         // Extend TTL based on the subscription retention fee and balance
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &retention_fee, &subscription.balance));
+        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, retention_fee, subscription.balance));
         // Publish subscription created event
         let data = (subscription_id, subscription.clone());
         e.events()
@@ -269,7 +269,7 @@ impl SubscriptionContract {
             .get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
         // Calculate daily retention fee based on subscription params
-        let retention_fee = calc_fee(&e, &subscription.heartbeat, &subscription.threshold);
+        let retention_fee = calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat);
         // Transfer tokens
         deposit(&e, &from, amount);
         // Update subscription balance
@@ -288,7 +288,7 @@ impl SubscriptionContract {
         // Update state
         e.set_subscription(subscription_id, &subscription);
         // Extend TTL based on the subscription retention fee and balance
-        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, &retention_fee, &subscription.balance));
+        e.extend_subscription_ttl(subscription_id, calc_ledgers_to_live(&e, retention_fee, subscription.balance));
         // Publish subscription deposited event
         e.events().publish(
             (REFLECTOR, symbol_short!("deposited"), subscription.owner.clone()),
@@ -373,7 +373,7 @@ impl SubscriptionContract {
         let subscription = e.get_subscription(subscription_id)
             .unwrap_or_else(|| panic_with_error!(e, Error::SubscriptionNotFound));
         // Calculate daily retention fee based on subscription params
-        calc_fee(&e, &subscription.heartbeat, &subscription.threshold)
+        calc_fee(e.get_fee(), &subscription.base, &subscription.quote, subscription.heartbeat)
     }
 
     // Get the last subscription ID
@@ -446,6 +446,28 @@ impl SubscriptionContract {
     }
 }
 
+pub fn calc_fee(base_fee: u64, base_symbol: &TickerAsset, quote_symbol: &TickerAsset, heartbeat: u32) -> u64 {
+    let heartbeat_fee = calc_hearbeat_fee(base_fee, heartbeat);
+    let complexity_factor = calc_complexity_factor(base_symbol, quote_symbol);
+    heartbeat_fee * complexity_factor
+}
+
+fn calc_hearbeat_fee(base_fee: u64, heartbeat: u32) -> u64 {
+    //120 is reference heartbeat
+    let hearbeat_fee = (120u128 * ((base_fee as u128).pow(2)) / (heartbeat as u128)).sqrt() as u64;
+    if hearbeat_fee < base_fee { // Minimum fee is base fee
+        return base_fee;
+    }
+    hearbeat_fee as u64
+}
+
+fn calc_complexity_factor(base_symbol: &TickerAsset, quote_symbol: &TickerAsset) -> u64 {
+    if base_symbol.source != quote_symbol.source {
+        return 2; //cross-price
+    }
+    1
+}
+
 // Check that contract has been properly initialized already
 fn panic_if_not_initialized(e: &Env) {
     if !e.is_initialized() {
@@ -481,14 +503,12 @@ fn now(e: &Env) -> u64 {
     e.ledger().timestamp() * 1000
 }
 
-fn calc_fee(e: &Env, heartbeat: &u32, threshold: &u32) -> u64 {
-    //TODO: implement the fee calculation logic here
-    e.get_fee()
-}
-
 // Calculate number of ledgers to live for subscription based on retention fee
-fn calc_ledgers_to_live(e: &Env, fee: &u64, amount: &u64) -> u32 {
-    let days: u32 = ((amount + fee - 1) / fee) as u32;
+fn calc_ledgers_to_live(e: &Env, fee: u64, amount: u64) -> u32 {
+    let mut days: u32 = ((amount + fee - 1) / fee) as u32;
+    if days == 0 {
+        days = 1;
+    }
     let ledgers = days * 17280;
     if ledgers > e.storage().max_ttl() {
         panic_with_error!(e, Error::InvalidAmount);
