@@ -2,14 +2,13 @@
 
 use super::*;
 use soroban_sdk::{
-    symbol_short,
     testutils::{storage::Persistent, Address as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
     vec, Bytes, Env, String,
 };
 use types::{
-    asset::Asset, contract_config::ContractConfig,
-    subscription_init_params::SubscriptionInitParams, ticker_asset::TickerAsset,
+    contract_config::ContractConfig, subscription_init_params::SubscriptionInitParams,
+    ticker_asset::TickerAsset,
 };
 
 fn init_contract_with_admin<'a>() -> (Env, SubscriptionContractClient<'a>, ContractConfig) {
@@ -49,11 +48,11 @@ fn test() {
     let subscription = SubscriptionInitParams {
         owner: owner.clone(),
         base: TickerAsset {
-            asset: Asset::Other(symbol_short!("BTC")),
+            asset: String::from_str(&env, "BTC"),
             source: String::from_str(&env, "source1"),
         },
         quote: TickerAsset {
-            asset: Asset::Other(symbol_short!("ETH")),
+            asset: String::from_str(&env, "ETH"),
             source: String::from_str(&env, "source2"),
         },
         threshold: 10,
@@ -61,7 +60,12 @@ fn test() {
         webhook: Bytes::from_array(&env, &[0; 2048]),
     };
 
-    let fee = calc_fee(config.fee, &subscription.base, &subscription.quote, subscription.heartbeat);
+    let fee = calc_fee(
+        config.fee,
+        &subscription.base,
+        &subscription.quote,
+        subscription.heartbeat,
+    );
 
     // create subscription
     let (subscription_id, _) = client.create_subscription(&subscription, &(fee * 2));
@@ -123,12 +127,12 @@ fn test() {
 fn fee_test() {
     let env = Env::default();
     let source1_asset = TickerAsset {
-        asset: Asset::Other(symbol_short!("BTC")),
+        asset: String::from_str(&env, "BTC"),
         source: String::from_str(&env, "source1"),
     };
 
     let source2_asset = TickerAsset {
-        asset: Asset::Other(symbol_short!("ETH")),
+        asset: String::from_str(&env, "ETH"),
         source: String::from_str(&env, "source2"),
     };
 
@@ -137,11 +141,29 @@ fn fee_test() {
         (100000000, &source1_asset, &source1_asset, 5, 489897948), // Same source, high heartbeat factor
         (100000000, &source1_asset, &source1_asset, 120, 100000000), // Reference heartbeat
         (100000000, &source1_asset, &source1_asset, 1000, 100000000), // Large heartbeat, min fee applied
-        (10000000000, &source1_asset, &source1_asset, 1000, 10000000000), // Large base fee, large heartbeat, min fee applied
+        (
+            10000000000,
+            &source1_asset,
+            &source1_asset,
+            1000,
+            10000000000,
+        ), // Large base fee, large heartbeat, min fee applied
         (500000000, &source1_asset, &source1_asset, 10, 1732050807), // Large base fee, small heartbeat
         (500000000, &source1_asset, &source2_asset, 10, 3464101614), // Large base fee, small heartbeat, cross-price
-        (100000000, &source1_asset, &source1_asset, u32::MAX, 100000000), // Maximum heartbeat, minimal fee
-         (100000000 * 1000000, &source1_asset, &source2_asset, 5, 979795897113270), // Huge base fee, small heartbeat, cross-price
+        (
+            100000000,
+            &source1_asset,
+            &source1_asset,
+            u32::MAX,
+            100000000,
+        ), // Maximum heartbeat, minimal fee
+        (
+            100000000 * 1000000,
+            &source1_asset,
+            &source2_asset,
+            5,
+            979795897113270,
+        ), // Huge base fee, small heartbeat, cross-price
     ];
 
     for (i, &(base_fee, base, quote, heartbeat, expected_fee)) in test_cases.iter().enumerate() {

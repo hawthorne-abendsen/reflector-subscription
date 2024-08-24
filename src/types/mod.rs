@@ -1,4 +1,3 @@
-pub mod asset;
 pub mod ticker_asset;
 pub mod subscription;
 pub mod error;
